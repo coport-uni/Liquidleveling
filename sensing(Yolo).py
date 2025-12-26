@@ -10,7 +10,7 @@ tank_class_id = 1
 
 tank_height = 8
 
-def detect_tank_and_liquidlevel(frame, model):
+def detect_tank_and_liquid(frame, model):
     inference_start_time = time.perf_counter()
     results = model(frame, conf=0.9, verbose=False)[0]
     inference_time_ms = (time.perf_counter() - inference_start_time) * 1000
@@ -63,7 +63,7 @@ def main():
         if not ret:
             break
 
-        tank_line, liquid_line, inference_time_ms = detect_tank_and_liquidlevel(frame, model)
+        tank_line, liquid_line, inference_time_ms = detect_tank_and_liquid(frame, model)
 
         if tank_line is not None:
             x1, y1, x2, y2 = tank_line
