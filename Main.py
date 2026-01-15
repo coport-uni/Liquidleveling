@@ -1,4 +1,4 @@
-from PyArduino import PyArduino 
+from PyArduino import PyArduino
 import time
 
 class AILeveling():
@@ -19,25 +19,14 @@ class AILeveling():
         Output : None
         """
         pin = 7
-        self.pa.run_digital_write(pin, True)
-        time.sleep(2)
         self.pa.run_digital_write(pin, False)
-        time.sleep(2)
-
-        # for i in range(4):
-        #     self.pa.run_digital_write(i+4, True)
-        #     time.sleep(2)
-        #     self.pa.run_digital_write(i+4, False)
-        #     time.sleep(2)
-
-        # value = pa.get_analog_state(2)
-        # print(value)
+        pin = 5
+        self.pa.run_digital_write(pin, False)
 
 def main():
     al = AILeveling("minima")
     while True:
         al.run_example()
 
-if __name__ == "__main__":
-    main()
-        
+
+main()
