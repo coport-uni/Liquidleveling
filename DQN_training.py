@@ -110,20 +110,20 @@ class DQNAgent:
         self.training_losses = []
         self.episode_rewards = []
 
-    def action_to_u(self, action: int) -> int:
+    def action_to_u(self, action:int):
         """Action index to pump speed"""
         return int(min_pump_speed + action)
 
-    def u_to_action(self, u: int) -> int:
+    def u_to_action(self, u:int):
         """Pump speed to action index"""
         return int(u - min_pump_speed)
 
-    def reset_episode(self, h0: float):
+    def reset_episode(self, h0:float):
         self.h_prev = float(h0)
         self.u_prev = float((min_pump_speed + max_pump_speed) // 2)
         self.error_int = 0.0
 
-    def build_state(self, h: float) -> np.ndarray:
+    def build_state(self, h:float):
         """현재 관측을 state vector로 변환 (정규화 포함)"""
         error = setpoint_cm - h
         
@@ -137,7 +137,7 @@ class DQNAgent:
         
         return state
 
-    def select_action(self, state: np.ndarray, training: bool = True) -> int:
+    def select_action(self, state:np.ndarray, training:bool = True):
         """Epsilon-greedy action selection"""
         # Exploration
         if training and random.random() < self.epsilon:
@@ -149,7 +149,7 @@ class DQNAgent:
             q_values = self.qNet(state_tensor)
             return int(q_values.argmax(dim=1).item())
 
-    def compute_reward(self, h: float, u: float, done: bool = False) -> float:
+    def compute_reward(self, h:float, u:float):
         # 1) Tracking error penalty (quadratic)
         error = abs(h - setpoint_cm)
         if error < 0.20:
@@ -202,13 +202,8 @@ class DQNAgent:
         return loss_value
 
     def update_target(self):
-        for target_param, policy_param in zip(
-            self.target_net.parameters(), 
-            self.qNet.parameters()
-        ):
-            target_param.data.copy_(
-                tau * policy_param.data + (1 - tau) * target_param.data
-            )
+        for target_param, policy_param in zip(self.target_net.parameters(), self.qNet.parameters()):
+            target_param.data.copy_(tau * policy_param.data + (1 - tau) * target_param.data)
 
     def decay_epsilon(self):
         """Epsilon decay with minimum bound"""
@@ -227,7 +222,7 @@ class DQNAgent:
             'steps_done': self.steps_done
         }
 
-    def save(self, path: str):
+    def save(self, path:str):
         """Model checkpoint 저장"""
         torch.save({
             "qNet": self.qNet.state_dict(),
@@ -272,12 +267,12 @@ class WaterTankSimulator:
         self.process_noise_std = 0.05
         self.measure_noise_std = 0.02
 
-    def reset(self) -> float:
+    def reset(self):
         self.h = float(np.random.uniform(2.0, 5.0))
         self.step_count = 0
         return self.h
 
-    def step_env(self, u: int) -> float:
+    def step_env(self, u:int):
         u = int(np.clip(u, min_pump_speed, max_pump_speed))
 
         self.h = self.a * self.h + self.b * u + self.c + float(np.random.normal(0, self.process_noise_std))
@@ -292,7 +287,7 @@ class WaterTankSimulator:
 
 # 6) Training
 
-def plot_curve(values, title: str):
+def plot_curve(values, title:str):
     plt.figure(figsize=(9, 4))
     plt.plot(values, alpha=0.6)
     plt.title(title)
@@ -383,7 +378,7 @@ def train():
 
     plot_training_results(reward_batch, losses)
 
-    agent.save("dqn_water_level_model.pth")
+    agent.save("dqn_liquid_level_model.pth")
 
 
 if __name__ == "__main__":
