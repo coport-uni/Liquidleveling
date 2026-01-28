@@ -152,7 +152,10 @@ class DQNAgent:
     def compute_reward(self, h: float, u: float, done: bool = False) -> float:
         # 1) Tracking error penalty (quadratic)
         error = abs(h - setpoint_cm)
-        tracking = -10.0 * (error ** 2)
+        if error < 0.20:
+            tracking = 20.0 * (1.0 - error/0.15)
+        else:
+            tracking = -15.0 * (error ** 2)
 
         # 2) Control smoothness penalty
         du = abs(u - self.u_prev)
@@ -295,8 +298,29 @@ def plot_curve(values, title: str):
     plt.tight_layout()
     plt.show()
 
+def plot_training_results(rewards, losses):
+    plt.figure(figsize=(12, 4))
+
+    plt.suptitle("DQN Water Tank Training Results", fontsize=14, fontweight="bold")
+
+    # Reward plot
+    plt.subplot(1, 2, 1)
+    plt.plot(rewards, alpha=0.7)
+    plt.title("Episode Reward")
+    plt.grid(True, alpha=0.3)
+
+    # Loss plot
+    plt.subplot(1, 2, 2)
+    plt.plot(losses, alpha=0.7)
+    plt.title("Training Loss")
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
 
 def train():
+    print("==학습시작==")
     agent = DQNAgent(state_dims, action_dims)
     env = WaterTankSimulator()
 
@@ -355,8 +379,7 @@ def train():
                 f"avg10 {np.mean(reward_batch[-10:]):.2f} | loss {losses[-1]:.4f} | eps {agent.epsilon:.3f}"
             )
 
-    plot_curve(reward_batch, "training reward")
-    plot_curve(losses, "training loss")
+    plot_training_results(reward_batch, losses)
 
     agent.save("dqn_water_level_model.pth")
 
