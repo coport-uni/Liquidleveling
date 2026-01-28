@@ -1,16 +1,3 @@
-"""
-=============================================================================
-dqn 모델 배포 - 실제 수위 제어 시스템 (u=5..15, 11 actions, no time, no done)
-=============================================================================
-- 학습 코드와 호환(dqn_control 통합본 기준):
-  * state_dim = 5  -> build_state(h)
-  * action_dim = 11 -> action(0..10) -> u = act_u_min + action
-  * time state 없음
-  * delta_u 기반 아님
-  * transition에 done 없음 (continuing task)
-=============================================================================
-"""
-
 import time
 import threading
 import cv2
@@ -21,35 +8,15 @@ from PyArduino import PyArduino
 import matplotlib.pyplot as plt
 from collections import deque
 
-# ✅ 반드시 학습 때 사용한 dqn_control(통합본)과 동일해야 함
+# 학습 때 사용한 DQN_training과 동일해야 함
 from DQN_training import (
-    DQNAgent,
-    tank_height_cm, setpoint_cm, control_period_s,
-    phys_min_pump, phys_max_pump,
-    act_u_min, act_u_max, action_dim, state_dim,
-    safety_h_max, safety_h_min,
+    DQNAgent, tank_height_cm, setpoint_cm, control_period_s,
+    min_pump_speed, max_pump_speed, act_u_min, act_u_max, state_dims, action_dims
 )
 
+epsilon = 0.05
+enable_learning = False
 
-# =============================================================================
-# 배포 설정 (소문자)
-# =============================================================================
-
-deployment_phase = 1  # 1: 파인튜닝, 2: 검증, 3: 최종 배포
-
-epsilon_by_phase = {
-    1: 0.2,
-    2: 0.05,
-    3: 0.0
-}
-
-enable_learning = {
-    1: True,
-    2: False,
-    3: False
-}
-
-# ✅ 네 학습 코드 저장 파일명과 일치하도록 수정
 model_path_dqn = "dqn_water_level_model.pth"
 
 camera_index = 1
@@ -59,9 +26,7 @@ tank_class_id = 1
 show_display = True
 
 
-# =============================================================================
-# 데이터 공유 클래스
-# =============================================================================
+# 데이터 공유 class
 
 class SharedLevel:
     def __init__(self):
@@ -109,9 +74,7 @@ class SharedLog:
                     self.q_value[:])
 
 
-# =============================================================================
 # 펌프 제어
-# =============================================================================
 
 class PumpController:
     def __init__(self, board_type="minima", inlet_valve_pin=7, outlet_valve_pin=5):
@@ -133,17 +96,13 @@ class PumpController:
         print("\n모든 밸브 닫힘")
 
     def set_pump_speed(self, speed: int):
-        speed = int(np.clip(speed, phys_min_pump, phys_max_pump))
+        speed = int(np.clip(speed, min_pump_speed, max_pump_speed))
         self.pa.run_pump_speed(speed)
 
     def shutdown(self):
         self.set_pump_speed(0)
         self.close_all_valves()
 
-
-# =============================================================================
-# 영상 처리
-# =============================================================================
 
 def detect_tank_and_liquid(frame, model):
     results = model(frame, conf=0.9, verbose=False)[0]
@@ -178,10 +137,6 @@ def calculate_liquid_level_cm(liquid_line, tank_box):
     return liquid_height_cm
 
 
-# =============================================================================
-# 스레드 함수
-# =============================================================================
-
 def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
     camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     model = YOLO(model_path)
@@ -211,15 +166,13 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
                 if liquid_line is not None:
                     liquid_height_cm = calculate_liquid_level_cm(liquid_line, tank_box)
                     cv2.line(frame, (x1, liquid_line), (x2, liquid_line), (0, 255, 255), 2)
-                    cv2.putText(frame, f"height: {liquid_height_cm:.2f}cm",
+                    cv2.putText(frame, f"Height: {liquid_height_cm:.2f}cm",
                                 (30, 40), cv2.FONT_ITALIC, 1, (0, 255, 255), 2)
-                    cv2.putText(frame, f"phase {deployment_phase}",
-                                (30, 80), cv2.FONT_ITALIC, 1, (255, 255, 0), 2)
                 else:
-                    cv2.putText(frame, "liquid not detected",
+                    cv2.putText(frame, "Liquid not detected",
                                 (30, 40), cv2.FONT_ITALIC, 1, (0, 0, 255), 2)
             else:
-                cv2.putText(frame, "tank not detected",
+                cv2.putText(frame, "Tank not detected",
                             (30, 40), cv2.FONT_ITALIC, 1, (0, 0, 255), 2)
 
             shared.update(liquid_height_cm)
@@ -240,33 +193,18 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
             cv2.destroyAllWindows()
 
 
-def control_thread_fn(shared: SharedLevel, pump: PumpController,
-                     stop_event: threading.Event, log: SharedLog,
-                     agent: DQNAgent):
-    """
-    학습 코드와 동일한 방식으로 제어(continuing, no done):
-    - state = agent.build_state(h)
-    - action = agent.select_action(state, training=online_learning)
-    - u_cmd = agent.action_to_u(action)  (u=5..15)
-    - 온라인 학습 시: buffer.push(s,a,r,s') (done 없음)
-    """
-    eps = epsilon_by_phase[deployment_phase]
-    online_learning = enable_learning[deployment_phase]
+def control_thread_fn(shared: SharedLevel, pump: PumpController, stop_event: threading.Event, log: SharedLog, agent: DQNAgent):
 
-    print(f"\n[phase {deployment_phase}] epsilon={eps}, learning={online_learning}")
-    print(f"action: {action_dim}개, u ∈ [{act_u_min}..{act_u_max}] (정수)")
-    print(f"state dim: {state_dim} (no time, no done)\n")
+    print(f"\n[Validation Mode]")
+    print(f"action: [{act_u_min}..{act_u_max}] (정수)")
+    print(f"state dim: {state_dims}\n")
 
-    agent.epsilon = eps
+    agent.epsilon = epsilon
 
     # 내부 상태 초기화
     agent.h_prev = setpoint_cm
     agent.u_prev = float((act_u_min + act_u_max) // 2)  # 10
     agent.error_int = 0.0
-
-    prev_state = None
-    prev_action = None
-    prev_reward = None
 
     next_tick = time.time()
     step_count = 0
@@ -291,10 +229,7 @@ def control_thread_fn(shared: SharedLevel, pump: PumpController,
             if (not valid) or (h is None) or (age > stale_sec):
                 pump.set_pump_speed(0)
                 log.add(time.time(), h, 0, setpoint_cm, 0.0, -1, 0.0)
-
-                # 끊긴 구간은 온라인 학습 전이로 넣지 않기
-                prev_state, prev_action, prev_reward = None, None, None
-
+                
                 next_tick = tick_start + control_period_s
                 continue
 
@@ -302,7 +237,7 @@ def control_thread_fn(shared: SharedLevel, pump: PumpController,
             state = agent.build_state(h)
 
             # 2) 액션 선택
-            action = agent.select_action(state, training=online_learning)
+            action = agent.select_action(state, training=enable_learning)
 
             # 3) action -> 절대 u (5..15)
             u_cmd = int(agent.action_to_u(action))
@@ -313,13 +248,6 @@ def control_thread_fn(shared: SharedLevel, pump: PumpController,
                 q_values = agent.policy_net(st)[0]
                 q_selected = float(q_values[action].item())
                 recent_q_values.append(q_selected)
-
-            # 4) 안전 보호(실제 배포에서 매우 중요)
-            if h > safety_h_max - 0.5:
-                print(f"\n⚠️ high level: {h:.2f}cm -> pump stop")
-                u_cmd = 0
-            elif h < safety_h_min + 0.5:
-                print(f"\n⚠️ low level: {h:.2f}cm")
 
             # 5) 펌프 제어
             pump.set_pump_speed(u_cmd)
@@ -333,46 +261,25 @@ def control_thread_fn(shared: SharedLevel, pump: PumpController,
                 -10.0, 10.0
             ))
 
-            # 8) 온라인 학습 (phase 1만)
-            if online_learning and prev_state is not None:
-                # ✅ done 없음: (s,a,r,s')
-                agent.buffer.push(prev_state, prev_action, prev_reward, state)
-
-                if len(agent.buffer) >= 1000:
-                    _ = agent.train_step()
-                    if (step_count % 10) == 0:
-                        agent.update_target()
-
-            prev_state, prev_action, prev_reward = state, action, reward
-
-            # 9) 로깅
+            # 8) 로깅
             avg_q = float(np.mean(recent_q_values)) if recent_q_values else 0.0
             log.add(time.time(), h, u_cmd, setpoint_cm, reward, action, q_selected)
 
             print(f"\n[dqn] h={h:.2f}cm | action={action} -> u={u_cmd} | "
                   f"q={q_selected:.2f} (avg {avg_q:.2f}) | reward={reward:.2f}")
 
-            # 10) 다음 주기 준비
+            # 9) 다음 주기 준비
             agent.h_prev = h
             agent.u_prev = float(u_cmd)
             step_count += 1
             next_tick = tick_start + control_period_s
 
     finally:
-        print("\n" + "=" * 70)
-        print("control end")
-        print("=" * 70)
-
-        if online_learning:
-            save_path = f"dqn_finetuned_u11_phase{deployment_phase}.pth"
-            agent.save(save_path)
-
+        print("제어 종료")
         pump.shutdown()
 
 
-# =============================================================================
-# 결과 시각화
-# =============================================================================
+# 결과 plot
 
 def plot_results(log: SharedLog):
     t, level, speed, sp, reward, action, q_value = log.snapshot()
@@ -421,26 +328,17 @@ def plot_results(log: SharedLog):
     plt.show()
 
 
-# =============================================================================
-# 메인
-# =============================================================================
-
 def main():
-    print("=" * 70)
-    print(f"dqn deploy - phase {deployment_phase}")
-    print("=" * 70)
-    print(f"epsilon: {epsilon_by_phase[deployment_phase]}")
-    print(f"learning: {enable_learning[deployment_phase]}")
-    print("=" * 70)
+    print(f"DQN Deployment - Validation Mode")
 
-    agent = DQNAgent()
+    agent = DQNAgent(state_dims, action_dims)
 
     # 모델 로드
     try:
         agent.load(model_path_dqn)
-        print(f"✅ model loaded: {model_path_dqn}")
+        print(f"Model loaded: {model_path_dqn}")
     except Exception as e:
-        print(f"⚠️ model load failed: {model_path_dqn}")
+        print(f"Model load failed: {model_path_dqn}")
         print("error:", e)
         return
 
@@ -459,7 +357,6 @@ def main():
         while not stop_event.is_set():
             time.sleep(0.1)
     except KeyboardInterrupt:
-        print("\n종료 신호 (ctrl+c)")
         stop_event.set()
 
     t_sense.join(timeout=1.0)
