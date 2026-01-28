@@ -112,7 +112,7 @@ class DQNAgent:
 
     def action_to_u(self, action:int):
         """Action index to pump speed"""
-        return int(min_pump_speed + action)
+        return int(action)
 
     def u_to_action(self, u:int):
         """Pump speed to action index"""
