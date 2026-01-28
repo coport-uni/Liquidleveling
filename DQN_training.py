@@ -263,7 +263,9 @@ class DQNAgent:
 
 class WaterTankSimulator:
     def __init__(self):
-        self.a, self.b, self.c = 0.95, 0.05, -0.1
+        self.a = 0.95
+        self.b = 0.05
+        self.c = -0.3
         self.h = setpoint_cm
         self.step_count = 0
 
