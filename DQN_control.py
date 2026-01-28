@@ -11,7 +11,7 @@ from collections import deque
 # 학습 때 사용한 DQN_training과 동일해야 함
 from DQN_training import (
     DQNAgent, tank_height_cm, setpoint_cm, control_period_s,
-    min_pump_speed, max_pump_speed, act_u_min, act_u_max, state_dims, action_dims
+    min_pump_speed, max_pump_speed, state_dims, action_dims
 )
 
 epsilon = 0.05
@@ -146,7 +146,7 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
         stop_event.set()
         return
 
-    window_name = "dqn water level control (u=5..15)"
+    window_name = "dqn water level control"
 
     try:
         while not stop_event.is_set():
@@ -196,14 +196,14 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
 def control_thread_fn(shared: SharedLevel, pump: PumpController, stop_event: threading.Event, log: SharedLog, agent: DQNAgent):
 
     print(f"\n[Validation Mode]")
-    print(f"action: [{act_u_min}..{act_u_max}] (정수)")
+    print(f"action: [{min_pump_speed}..{max_pump_speed}] (정수)")
     print(f"state dim: {state_dims}\n")
 
     agent.epsilon = epsilon
 
     # 내부 상태 초기화
     agent.h_prev = setpoint_cm
-    agent.u_prev = float((act_u_min + act_u_max) // 2)  # 10
+    agent.u_prev = float((min_pump_speed + max_pump_speed) // 2)
     agent.error_int = 0.0
 
     next_tick = time.time()
@@ -239,13 +239,13 @@ def control_thread_fn(shared: SharedLevel, pump: PumpController, stop_event: thr
             # 2) 액션 선택
             action = agent.select_action(state, training=enable_learning)
 
-            # 3) action -> 절대 u (5..15)
+            # 3) action -> 절대 u
             u_cmd = int(agent.action_to_u(action))
 
             # q 모니터링
             with torch.no_grad():
-                st = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(agent.device)
-                q_values = agent.policy_net(st)[0]
+                st = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+                q_values = agent.qNet(st)[0]
                 q_selected = float(q_values[action].item())
                 recent_q_values.append(q_selected)
 
