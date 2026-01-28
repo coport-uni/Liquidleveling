@@ -6,7 +6,6 @@ import torch
 from ultralytics import YOLO
 from PyArduino import PyArduino
 import matplotlib.pyplot as plt
-from collections import deque
 
 # 학습 때 사용한 DQN_training과 동일해야 함
 from DQN_training import (
@@ -15,7 +14,6 @@ from DQN_training import (
 )
 
 epsilon = 0.05
-enable_learning = False
 
 model_path_dqn = "dqn_liquid_level_model.pth"
 
@@ -196,18 +194,13 @@ def control_thread_fn(shared:SharedLevel, pump:PumpController, stop_event:thread
     print(f"action: [{min_pump_speed} - {max_pump_speed}] (정수)")
     print(f"state dim: {state_dims}\n")
 
-    agent.epsilon = epsilon
+    agent.epsilon = float(epsilon)
 
     # 내부 상태 초기화
-    agent.h_prev = setpoint_cm
-    agent.u_prev = float((min_pump_speed + max_pump_speed) // 2)
-    agent.error_int = 0.0
+    agent.reset_episode()
 
     next_tick = time.time()
-    step_count = 0
     stale_sec = 3.0
-
-    recent_q_values = deque(maxlen=20)
 
     try:
         while not stop_event.is_set():
@@ -218,25 +211,27 @@ def control_thread_fn(shared:SharedLevel, pump:PumpController, stop_event:thread
 
             tick_start = time.time()
 
-            # 최신 수위 읽기
             h, ts, valid = shared.get()
             age = time.time() - ts
 
-            # 데이터 유효성 검사
             if (not valid) or (h is None) or (age > stale_sec):
                 pump.set_pump_speed(0)
+                agent.u_prev = 0.0
                 log.add(time.time(), h, 0, setpoint_cm, 0.0, -1, 0.0)
                 
                 next_tick = tick_start + control_period_s
                 continue
 
-            # 1) 상태 구성
+            # 적분 업데이트
+            agent.error_int = float(np.clip(agent.error_int + (setpoint_cm - h) * control_period_s, -10.0, 10.0))
+            
+            # 상태 구성
             state = agent.build_state(h)
 
-            # 2) 액션 선택
-            action = agent.select_action(state, training=enable_learning)
+            # 액션 선택
+            action = agent.select_action(state, training=False)
 
-            # 3) action -> 절대 u
+            # action -> 절대 u
             u_cmd = int(agent.action_to_u(action))
 
             # q 모니터링
@@ -244,30 +239,19 @@ def control_thread_fn(shared:SharedLevel, pump:PumpController, stop_event:thread
                 st = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
                 q_values = agent.qNet(st)[0]
                 q_selected = float(q_values[action].item())
-                recent_q_values.append(q_selected)
 
-            # 5) 펌프 제어
+            # 펌프 제어
             pump.set_pump_speed(u_cmd)
 
-            # 6) 보상 계산 (학습과 동일한 reward 정의가 중요)
-            reward = agent.compute_reward(h, u_cmd)
+            # 보상 계산 (학습과 동일한 reward 정의가 중요)
+            reward = agent.compute_reward(h, agent.u_prev)
+            agent.u_prev = float(u_cmd)
 
-            # 7) 적분 업데이트
-            agent.error_int = float(np.clip(
-                agent.error_int + (setpoint_cm - h) * control_period_s,
-                -10.0, 10.0
-            ))
-
-            # 8) 로깅
             log.add(time.time(), h, u_cmd, setpoint_cm, reward, action, q_selected)
 
             print(f"\n[h={h:.2f}cm / action={action} -> u={u_cmd}] / "
                   f"[q={q_selected:.2f} / reward={reward:.2f}]")
 
-            # 9) 다음 주기 준비
-            agent.h_prev = h
-            agent.u_prev = float(u_cmd)
-            step_count += 1
             next_tick = tick_start + control_period_s
 
     finally:
