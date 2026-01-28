@@ -17,7 +17,7 @@ from DQN_training import (
 epsilon = 0.05
 enable_learning = False
 
-model_path_dqn = "dqn_water_level_model.pth"
+model_path_dqn = "dqn_liquid_level_model.pth"
 
 camera_index = 1
 model_path = "20251223nano.pt"
@@ -146,7 +146,7 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
         stop_event.set()
         return
 
-    window_name = "dqn water level control"
+    window_name = "DQN liquid level control"
 
     try:
         while not stop_event.is_set():
@@ -166,14 +166,11 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
                 if liquid_line is not None:
                     liquid_height_cm = calculate_liquid_level_cm(liquid_line, tank_box)
                     cv2.line(frame, (x1, liquid_line), (x2, liquid_line), (0, 255, 255), 2)
-                    cv2.putText(frame, f"Height: {liquid_height_cm:.2f}cm",
-                                (30, 40), cv2.FONT_ITALIC, 1, (0, 255, 255), 2)
+                    cv2.putText(frame, f"Height: {liquid_height_cm:.2f}cm", (30, 40), cv2.FONT_ITALIC, 1, (0, 255, 255), 2)
                 else:
-                    cv2.putText(frame, "Liquid not detected",
-                                (30, 40), cv2.FONT_ITALIC, 1, (0, 0, 255), 2)
+                    cv2.putText(frame, "Liquid not detected", (30, 40), cv2.FONT_ITALIC, 1, (0, 0, 255), 2)
             else:
-                cv2.putText(frame, "Tank not detected",
-                            (30, 40), cv2.FONT_ITALIC, 1, (0, 0, 255), 2)
+                cv2.putText(frame, "Tank not detected", (30, 40), cv2.FONT_ITALIC, 1, (0, 0, 255), 2)
 
             shared.update(liquid_height_cm)
 
@@ -193,10 +190,10 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
             cv2.destroyAllWindows()
 
 
-def control_thread_fn(shared: SharedLevel, pump: PumpController, stop_event: threading.Event, log: SharedLog, agent: DQNAgent):
+def control_thread_fn(shared:SharedLevel, pump:PumpController, stop_event:threading.Event, log:SharedLog, agent:DQNAgent):
 
-    print(f"\n[Validation Mode]")
-    print(f"action: [{min_pump_speed}..{max_pump_speed}] (정수)")
+    print(f"\n[Validation mode]")
+    print(f"action: [{min_pump_speed} - {max_pump_speed}] (정수)")
     print(f"state dim: {state_dims}\n")
 
     agent.epsilon = epsilon
@@ -262,11 +259,10 @@ def control_thread_fn(shared: SharedLevel, pump: PumpController, stop_event: thr
             ))
 
             # 8) 로깅
-            avg_q = float(np.mean(recent_q_values)) if recent_q_values else 0.0
             log.add(time.time(), h, u_cmd, setpoint_cm, reward, action, q_selected)
 
-            print(f"\n[dqn] h={h:.2f}cm | action={action} -> u={u_cmd} | "
-                  f"q={q_selected:.2f} (avg {avg_q:.2f}) | reward={reward:.2f}")
+            print(f"\n[h={h:.2f}cm / action={action} -> u={u_cmd}] / "
+                  f"[q={q_selected:.2f} / reward={reward:.2f}]")
 
             # 9) 다음 주기 준비
             agent.h_prev = h
@@ -281,7 +277,7 @@ def control_thread_fn(shared: SharedLevel, pump: PumpController, stop_event: thr
 
 # 결과 plot
 
-def plot_results(log: SharedLog):
+def plot_results(log:SharedLog):
     t, level, speed, sp, reward, action, q_value = log.snapshot()
     if len(t) < 2:
         print("그래프 데이터 부족")
@@ -299,7 +295,7 @@ def plot_results(log: SharedLog):
     ax1.axhline(setpoint_cm, linestyle="--", linewidth=2, label="setpoint")
     ax1.set_xlabel("time (s)")
     ax1.set_ylabel("level (cm)")
-    ax1.set_title("water level control (dqn)")
+    ax1.set_title("liquid level control (DQN)")
     ax1.grid(True, alpha=0.3)
     ax1.legend()
 
@@ -313,7 +309,7 @@ def plot_results(log: SharedLog):
     ax3.plot(t_rel, reward, linewidth=2, label="reward")
     ax3.set_xlabel("time (s)")
     ax3.set_ylabel("reward")
-    ax3.set_title("instantaneous reward")
+    ax3.set_title("reward")
     ax3.grid(True, alpha=0.3)
     ax3.legend()
 
@@ -329,7 +325,7 @@ def plot_results(log: SharedLog):
 
 
 def main():
-    print(f"DQN Deployment - Validation Mode")
+    print(f"DQN - Validation mode")
 
     agent = DQNAgent(state_dims, action_dims)
 
