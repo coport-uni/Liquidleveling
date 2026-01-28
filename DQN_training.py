@@ -20,7 +20,7 @@ max_pump_speed = 20
 num_actions = max_pump_speed - min_pump_speed + 1
 
 # 상태 / 액션 차원
-state_dims = 5   # [h, h_prev, error, error_int, u_prev]
+state_dims = 3   # [h, error, error_int]
 action_dims = num_actions
 
 # DQN 파라미터
@@ -53,7 +53,6 @@ class ReplayBuffer:
         self.buffer.append(Transition(*args))
 
     def sample_minibatch(self):
-
         return random.sample(self.buffer, batch_size)
 
     def __len__(self):
@@ -102,24 +101,21 @@ class DQNAgent:
         self.steps_done = 0
         self.episodes_done = 0
 
-        # State tracking
-        self.h_prev = setpoint_cm
+        # Internal state tracking (상태에는 포함 안 되지만 내부적으로 추적)
         self.u_prev = float((min_pump_speed + max_pump_speed) // 2)
         self.error_int = 0.0
         
         self.training_losses = []
-        self.episode_rewards = []
 
     def action_to_u(self, action:int):
         """Action index to pump speed"""
-        return int(action)
+        return int(min_pump_speed + action)
 
     def u_to_action(self, u:int):
         """Pump speed to action index"""
         return int(u - min_pump_speed)
 
-    def reset_episode(self, h0:float):
-        self.h_prev = float(h0)
+    def reset_episode(self):
         self.u_prev = float((min_pump_speed + max_pump_speed) // 2)
         self.error_int = 0.0
 
@@ -129,10 +125,8 @@ class DQNAgent:
         
         state = np.array([
             h / tank_height_cm,                          # [0, 1]
-            self.h_prev / tank_height_cm,                # [0, 1]
             error / tank_height_cm,                      # [-1, 1]
             np.clip(self.error_int, -10.0, 10.0) / 10.0, # [-1, 1]
-            self.u_prev / max_pump_speed,                # [0, 1]
         ], dtype=np.float32)
         
         return state
@@ -150,14 +144,14 @@ class DQNAgent:
             return int(q_values.argmax(dim=1).item())
 
     def compute_reward(self, h:float, u:float):
-        # 1) Tracking error penalty (quadratic)
+        # Tracking error penalty
         error = abs(h - setpoint_cm)
         if error < 0.20:
-            tracking = 20.0 * (1.0 - error/0.15)
+            tracking = 20.0 * max(0.0, 1.0 - error/0.20)
         else:
             tracking = -15.0 * (error ** 2)
 
-        # 2) Control smoothness penalty
+        # Control smoothness penalty (u_prev는 내부 변수로 유지)
         du = abs(u - self.u_prev)
         smooth = -0.1 * (du ** 2)
 
@@ -174,7 +168,7 @@ class DQNAgent:
         # Convert to tensors
         state_batch = torch.tensor(np.array([t.state for t in minibatch]), dtype=torch.float32)
         action_batch = torch.tensor([t.action for t in minibatch], dtype=torch.int64)
-        reward_batch = torch.tensor([t.reward for t in minibatch], dtype=torch.float32)
+        episode_rewards = torch.tensor([t.reward for t in minibatch], dtype=torch.float32)
         next_state_batch = torch.tensor(np.array([t.next_state for t in minibatch]), dtype=torch.float32)
         
         # Current Q-values: Q(s, a)
@@ -183,7 +177,7 @@ class DQNAgent:
         # Target Q-values: r + gamma * max_a' Q_target(s', a')
         with torch.no_grad():
             next_q_values = self.target_net(next_state_batch).max(1)[0]
-            targets = reward_batch + gamma * next_q_values
+            targets = episode_rewards + gamma * next_q_values
 
         loss = F.smooth_l1_loss(q_values, targets)
 
@@ -287,14 +281,6 @@ class WaterTankSimulator:
 
 # 6) Training
 
-def plot_curve(values, title:str):
-    plt.figure(figsize=(9, 4))
-    plt.plot(values, alpha=0.6)
-    plt.title(title)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
-
 def plot_training_results(rewards, losses):
     plt.figure(figsize=(12, 4))
 
@@ -304,12 +290,16 @@ def plot_training_results(rewards, losses):
     plt.subplot(1, 2, 1)
     plt.plot(rewards, alpha=0.7)
     plt.title("Episode Reward")
+    plt.xlabel("Episode")
+    plt.ylabel("Cumulative Reward")
     plt.grid(True, alpha=0.3)
 
     # Loss plot
     plt.subplot(1, 2, 2)
     plt.plot(losses, alpha=0.7)
     plt.title("Training Loss")
+    plt.xlabel("Episode")
+    plt.ylabel("Loss")
     plt.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -318,15 +308,16 @@ def plot_training_results(rewards, losses):
 
 def train():
     print("==학습시작==")
+    print(f"State dimensions: {state_dims} [h, error, error_int]")
     agent = DQNAgent(state_dims, action_dims)
     env = WaterTankSimulator()
 
-    reward_batch = []
+    episode_rewards = []
     losses = []
 
     for ep in range(num_episodes):
         h = env.reset()
-        agent.reset_episode(h)
+        agent.reset_episode()
 
         ep_reward = 0.0
         ep_losses = []
@@ -342,12 +333,11 @@ def train():
             # 결과 기반 보상
             reward = agent.compute_reward(h_next, u)
 
-            # 내부 상태 업데이트 순서
-            agent.h_prev = h
+            # 내부 상태 업데이트
             agent.u_prev = float(u)
 
             agent.error_int = float(np.clip(
-                agent.error_int + (setpoint_cm - h) * control_period_s,
+                agent.error_int + (setpoint_cm - h_next) * control_period_s,
                 -10.0, 10.0
             ))
 
@@ -367,19 +357,18 @@ def train():
         agent.decay_epsilon()
         agent.episodes_done += 1
 
-        reward_batch.append(ep_reward)
+        episode_rewards.append(ep_reward)
         losses.append(float(np.mean(ep_losses)) if ep_losses else 0.0)
 
         if (ep + 1) % 10 == 0:
             print(
                 f"ep {ep+1}/{num_episodes} | reward {ep_reward:.2f} | "
-                f"avg10 {np.mean(reward_batch[-10:]):.2f} | loss {losses[-1]:.4f} | eps {agent.epsilon:.3f}"
+                f"loss {losses[-1]:.4f} | eps {agent.epsilon:.3f}"
             )
 
-    plot_training_results(reward_batch, losses)
+    plot_training_results(episode_rewards, losses)
 
     agent.save("dqn_liquid_level_model.pth")
-
 
 if __name__ == "__main__":
     train()
