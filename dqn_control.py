@@ -19,7 +19,7 @@ from ultralytics import YOLO
 from py_arduino import PyArduino
 
 # Ensure these match the values used during DQN_training
-from DQN_training import (
+from dqn_training import (
     DQNAgent,
     action_dims,
     control_period_s,
@@ -49,10 +49,9 @@ def clamp(value: float, lower: float, upper: float) -> float:
 
 
 class SharedLevel:
-    """Thread-safe carrier for the most recent liquid-height reading."""
+    """Thread-safe carrier for the latest liquid-height reading."""
 
     def __init__(self):
-        """Initialise empty state with the lock ready to use."""
         self.lock = threading.Lock()
         self.liquid_height_cm: Optional[float] = None
         self.timestamp: float = 0.0
@@ -66,16 +65,15 @@ class SharedLevel:
             self.valid = liquid_height_cm is not None
 
     def get(self) -> Tuple[Optional[float], float, bool]:
-        """Return the latest reading, its timestamp, and validity flag."""
+        """Return the latest reading, timestamp, and validity flag."""
         with self.lock:
             return self.liquid_height_cm, self.timestamp, self.valid
 
 
 class SharedLog:
-    """Thread-safe accumulator used for the post-run matplotlib plots."""
+    """Thread-safe accumulator used for the post-run plots."""
 
     def __init__(self):
-        """Initialise empty log buffers including DQN specific metrics."""
         self.lock = threading.Lock()
         self.t = []
         self.level = []
@@ -119,7 +117,6 @@ class PumpController:
         inlet_valve_pin=7,
         outlet_valve_pin=5,
     ):
-        """Connect to the board and leave the rig in a ready state."""
         self.pa = PyArduino(board_type)
         self.inlet_valve_pin = inlet_valve_pin
         self.outlet_valve_pin = outlet_valve_pin
@@ -128,7 +125,7 @@ class PumpController:
         self.set_pump_speed(0)
 
     def open_all_valves(self):
-        """Open both inlet and outlet valves and log the action."""
+        """Open both inlet and outlet valves."""
         self.pa.run_digital_write(self.inlet_valve_pin, True)
         self.pa.run_digital_write(self.outlet_valve_pin, True)
         print("All valves opened.")
@@ -153,25 +150,37 @@ class PumpController:
 class LiquidLevelDetector:
     """YOLO-based detector for tank and liquid level estimation."""
 
-    def __init__(self, model_path, tank_height, tank_class_id=1, liquid_class_id=0):
+    def __init__(
+        self,
+        model_path,
+        tank_height,
+        tank_class_id=1,
+        liquid_class_id=0,
+    ):
         self.model = YOLO(model_path)
         self.tank_height_cm = tank_height
         self.tank_class_id = tank_class_id
         self.liquid_class_id = liquid_class_id
 
     def process_frame(self, frame):
+        """Detect tank and liquid and return the derived level."""
         tank_box, liquid_line, inference_time_ms = self.detect(frame)
 
         liquid_height_cm = None
         if tank_box is not None and liquid_line is not None:
-            liquid_height_cm = self.calculate_level(liquid_line, tank_box)
+            liquid_height_cm = self.calculate_level(
+                liquid_line, tank_box
+            )
 
         return tank_box, liquid_line, liquid_height_cm, inference_time_ms
 
     def detect(self, frame):
+        """Return the highest-confidence tank box and liquid line."""
         inference_start_time = time.perf_counter()
         results = self.model(frame, conf=0.9, verbose=False)[0]
-        inference_time_ms = (time.perf_counter() - inference_start_time) * 1000.0
+        inference_time_ms = (
+            time.perf_counter() - inference_start_time
+        ) * 1000.0
 
         tank_box = None
         best_tank_confidence = -1.0
@@ -185,31 +194,39 @@ class LiquidLevelDetector:
 
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
 
-            if class_id == self.tank_class_id and conf > best_tank_confidence:
+            is_tank = class_id == self.tank_class_id
+            is_liquid = class_id == self.liquid_class_id
+
+            if is_tank and conf > best_tank_confidence:
                 best_tank_confidence = conf
                 tank_box = (x1, y1, x2, y2)
-            elif class_id == self.liquid_class_id and conf > best_liquid_confidence:
+            elif is_liquid and conf > best_liquid_confidence:
                 best_liquid_confidence = conf
                 liquid_line = y1
 
         return tank_box, liquid_line, inference_time_ms
 
     def calculate_level(self, liquid_line, tank_box):
+        """Linear-interpolate the liquid height between tank edges."""
         _, tank_top_y, _, tank_bottom_y = tank_box
 
         if tank_bottom_y <= tank_top_y:
             return None
 
-        ratio = float(tank_bottom_y - liquid_line) / float(tank_bottom_y - tank_top_y)
+        tank_pixel_height = float(tank_bottom_y - tank_top_y)
+        liquid_pixel_height = float(tank_bottom_y - liquid_line)
+        ratio = liquid_pixel_height / tank_pixel_height
         liquid_height_cm = ratio * self.tank_height_cm
 
         return clamp(liquid_height_cm, 0.0, self.tank_height_cm)
 
 
-def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
+def sensing_thread_fn(
+    shared: SharedLevel, stop_event: threading.Event
+):
     """Capture frames and publish liquid-height estimates."""
     camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    
+
     detector = LiquidLevelDetector(
         model_path=model_path,
         tank_height=tank_height_cm,
@@ -223,7 +240,7 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
         return
 
     window_name = "DQN Liquid Level Control"
-    
+
     try:
         while not stop_event.is_set():
             ret, frame = camera.read()
@@ -232,14 +249,28 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
                 stop_event.set()
                 break
 
-            tank_box, liquid_line, liquid_height_cm, _ = detector.process_frame(frame)
+            tank_box, liquid_line, liquid_height_cm, _ = (
+                detector.process_frame(frame)
+            )
 
             if tank_box is not None:
                 x1, y1, x2, y2 = tank_box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(
+                    frame, (x1, y1), (x2, y2), (0, 255, 0), 2
+                )
 
-                if liquid_line is not None and liquid_height_cm is not None:
-                    cv2.line(frame, (x1, liquid_line), (x2, liquid_line), (0, 255, 255), 2)
+                has_liquid = (
+                    liquid_line is not None
+                    and liquid_height_cm is not None
+                )
+                if has_liquid:
+                    cv2.line(
+                        frame,
+                        (x1, liquid_line),
+                        (x2, liquid_line),
+                        (0, 255, 255),
+                        2,
+                    )
                     cv2.putText(
                         frame,
                         f"Height: {liquid_height_cm:.2f}cm",
@@ -276,13 +307,14 @@ def sensing_thread_fn(shared: SharedLevel, stop_event: threading.Event):
                 cv2.imshow(window_name, frame)
                 key = cv2.waitKey(10)
 
-                # ESC closes the window and stops the run
                 if key & 0xFF == 27:
                     stop_event.set()
                     break
 
-                # Manually closing the window also stops the run
-                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                window_closed = cv2.getWindowProperty(
+                    window_name, cv2.WND_PROP_VISIBLE
+                ) < 1
+                if window_closed:
                     stop_event.set()
                     break
 
@@ -322,36 +354,49 @@ def control_thread_fn(
             h, ts, valid = shared.get()
             age = time.time() - ts
 
-            # Fallback for stale or invalid data
-            if (not valid) or (h is None) or (age > stale_sec):
+            is_stale = (not valid) or (h is None) or (age > stale_sec)
+            if is_stale:
                 pump.set_pump_speed(0)
                 agent.u_prev = 0.0
-                log.add(time.time(), h, 0, setpoint_cm, 0.0, -1, 0.0)
+                log.add(
+                    time.time(), h, 0, setpoint_cm, 0.0, -1, 0.0
+                )
                 next_tick = tick_start + control_period_s
                 continue
-            
-            # Build state and select action
+
             state = agent.build_state(h)
             action = agent.select_action(state, training=False)
             u_cmd = int(agent.action_to_u(action))
 
-            # Monitor Q-values
             with torch.no_grad():
-                st = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-                q_values = agent.qNet(st)[0]
+                st = torch.tensor(
+                    state, dtype=torch.float32
+                ).unsqueeze(0)
+                q_values = agent.q_net(st)[0]
                 q_selected = float(q_values[action].item())
 
-            # Execute pump control
             pump.set_pump_speed(u_cmd)
 
-            # Compute reward (using the same definition as training)
+            # Reward uses the same definition as training so the
+            # logged values are directly comparable.
             reward = agent.compute_reward(h, float(u_cmd))
             agent.u_prev = float(u_cmd)
-            agent.error_int = float(
-                np.clip(agent.error_int + (setpoint_cm - h) * control_period_s, -10.0, 10.0)
-            )
+            agent.error_int = float(np.clip(
+                agent.error_int
+                + (setpoint_cm - h) * control_period_s,
+                -10.0,
+                10.0,
+            ))
 
-            log.add(time.time(), h, u_cmd, setpoint_cm, reward, action, q_selected)
+            log.add(
+                time.time(),
+                h,
+                u_cmd,
+                setpoint_cm,
+                reward,
+                action,
+                q_selected,
+            )
 
             print(
                 f"[h={h:.2f}cm | action={action:2d} -> u={u_cmd:2d}] "
@@ -378,35 +423,47 @@ def plot_results(log: SharedLog):
     t_level = [tt for tt, lv in zip(t_rel, level) if lv is not None]
     level_valid = [lv for lv in level if lv is not None]
 
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(
+        2, 2, figsize=(14, 10)
+    )
 
-    # (1) Level plot
-    ax1.plot(t_level, level_valid, linewidth=2, label="Liquid level")
-    ax1.axhline(setpoint_cm, linestyle="--", color="r", linewidth=2, label="Setpoint")
+    ax1.plot(
+        t_level, level_valid, linewidth=2, label="Liquid level"
+    )
+    ax1.axhline(
+        setpoint_cm,
+        linestyle="--",
+        color="r",
+        linewidth=2,
+        label="Setpoint",
+    )
     ax1.set_xlabel("Time (s)")
     ax1.set_ylabel("Level (cm)")
     ax1.set_title("Liquid Level Control (DQN)")
     ax1.grid(True, alpha=0.3)
     ax1.legend()
 
-    # (2) Pump speed plot
-    ax2.plot(t_rel, speed, linewidth=2, color="orange", label="Pump speed")
+    ax2.plot(
+        t_rel, speed, linewidth=2, color="orange", label="Pump speed"
+    )
     ax2.set_xlabel("Time (s)")
     ax2.set_ylabel("Speed")
     ax2.set_title("Control Input")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
 
-    # (3) Reward plot
-    ax3.plot(t_rel, reward, linewidth=2, color="green", label="Reward")
+    ax3.plot(
+        t_rel, reward, linewidth=2, color="green", label="Reward"
+    )
     ax3.set_xlabel("Time (s)")
     ax3.set_ylabel("Reward")
     ax3.set_title("Step Reward")
     ax3.grid(True, alpha=0.3)
     ax3.legend()
 
-    # (4) Q-value plot
-    ax4.plot(t_rel, q_value, linewidth=2, color="purple", label="Q-value")
+    ax4.plot(
+        t_rel, q_value, linewidth=2, color="purple", label="Q-value"
+    )
     ax4.set_xlabel("Time (s)")
     ax4.set_ylabel("Q-value")
     ax4.set_title("Selected Action Q-value")
@@ -433,7 +490,11 @@ def main():
     shared = SharedLevel()
     log = SharedLog()
     stop_event = threading.Event()
-    pump = PumpController(board_type="minima", inlet_valve_pin=7, outlet_valve_pin=5)
+    pump = PumpController(
+        board_type="minima",
+        inlet_valve_pin=7,
+        outlet_valve_pin=5,
+    )
 
     t_sense = threading.Thread(
         target=sensing_thread_fn,
