@@ -17,7 +17,7 @@ import time
 import threading
 import cv2
 from ultralytics import YOLO
-from PyArduino import PyArduino
+from py_arduino import PyArduino
 import matplotlib.pyplot as plt
 
 
