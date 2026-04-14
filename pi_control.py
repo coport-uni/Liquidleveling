@@ -349,7 +349,13 @@ class LiquidLevelDetector:
     logic into a single cohesive unit.
     """
 
-    def __init__(self, model_path, tank_height_cm, tank_class_id=1, liquid_class_id=0):
+    def __init__(
+        self,
+        model_path,
+        tank_height_cm,
+        tank_class_id=1,
+        liquid_class_id=0,
+    ):
         """Initialise the YOLO model and physical parameters.
 
         Args:
@@ -385,7 +391,9 @@ class LiquidLevelDetector:
         """Find the highest-confidence tank and liquid detections."""
         inference_start_time = time.perf_counter()
         results = self.model(frame, conf=0.9, verbose=False)[0]
-        inference_time_ms = (time.perf_counter() - inference_start_time) * 1000.0
+        inference_time_ms = (
+            time.perf_counter() - inference_start_time
+        ) * 1000.0
 
         tank_box = None
         best_tank_confidence = -1.0
@@ -399,10 +407,13 @@ class LiquidLevelDetector:
 
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
 
-            if class_id == self.tank_class_id and conf > best_tank_confidence:
+            is_tank = class_id == self.tank_class_id
+            is_liquid = class_id == self.liquid_class_id
+
+            if is_tank and conf > best_tank_confidence:
                 best_tank_confidence = conf
                 tank_box = (x1, y1, x2, y2)
-            elif class_id == self.liquid_class_id and conf > best_liquid_confidence:
+            elif is_liquid and conf > best_liquid_confidence:
                 best_liquid_confidence = conf
                 liquid_line = y1
 
@@ -419,7 +430,9 @@ class LiquidLevelDetector:
         if tank_bottom_y <= tank_top_y:
             return None
 
-        ratio = float(tank_bottom_y - liquid_line) / float(tank_bottom_y - tank_top_y)
+        tank_pixel_height = float(tank_bottom_y - tank_top_y)
+        liquid_pixel_height = float(tank_bottom_y - liquid_line)
+        ratio = liquid_pixel_height / tank_pixel_height
         liquid_height_cm = ratio * self.tank_height_cm
 
         return clamp(liquid_height_cm, 0.0, self.tank_height_cm)
@@ -438,7 +451,7 @@ def sensing_thread_fn(
             can shut down safely.
     """
     camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    
+
     detector = LiquidLevelDetector(
         model_path=model_path,
         tank_height_cm=tank_height_cm,
@@ -462,7 +475,9 @@ def sensing_thread_fn(
                 stop_event.set()
                 break
 
-            tank_box, liquid_line, liquid_height_cm, inference_time_ms = detector.process_frame(frame)
+            tank_box, liquid_line, liquid_height_cm, inference_time_ms = (
+                detector.process_frame(frame)
+            )
 
             if tank_box is not None:
                 x1, y1, x2, y2 = tank_box
@@ -538,7 +553,7 @@ def sensing_thread_fn(
             capture_to_display_ms = (
                 frame_display_done_time - loop_start_time
             ) * 1000
-            
+
             if liquid_height_cm is not None:
                 print(
                     f"level:{liquid_height_cm:.2f}cm, "
@@ -599,7 +614,12 @@ def control_thread_fn(
             liquid_height_cm, ts, valid = shared.get()
             age = time.time() - ts
 
-            if (not valid) or (liquid_height_cm is None) or (age > stale_sec):
+            is_stale = (
+                (not valid)
+                or (liquid_height_cm is None)
+                or (age > stale_sec)
+            )
+            if is_stale:
                 pump.set_pump_speed(0)
                 pi_controller.reset()
                 log.add(
