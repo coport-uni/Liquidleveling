@@ -7,7 +7,7 @@ in pump speed (chattering).
 
 import collections
 import random
-from typing import List, Tuple, Dict, Optional
+from typing import List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
