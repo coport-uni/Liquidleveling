@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 from scipy.optimize import minimize
 from ultralytics import YOLO
-from PyArduino import PyArduino
+from py_arduino import PyArduino
 import matplotlib.pyplot as plt
 
 

@@ -1,11 +1,20 @@
-import time
-import threading
-import cv2
-from ultralytics import YOLO
-from PyArduino import PyArduino
-import matplotlib.pyplot as plt
+"""PI liquid-level controller backed by YOLO-based sensing.
 
-# 주석, class 정리 필요 (변수명도)
+Runs two threads: a sensing thread that reads frames from the camera
+and publishes the estimated liquid height, and a control thread that
+ticks every ``control_period_s`` to compute a pump speed via PI plus a
+steady-state feed-forward. A final matplotlib plot summarises the run.
+"""
+
+import threading
+import time
+
+import cv2
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+
+from py_arduino import PyArduino
+
 camera_index = 1
 
 model_path = "20251223nano.pt"
@@ -18,23 +27,36 @@ setpoint_cm = 4.00
 
 show_display = True
 
-# PI gains
-Kp = 4.0
-Ki = 0.005  # 적분 이득 (조정 필요)
+# PI gains (lower-case per CLAUDE.md Naming table).
+kp = 4.0
+ki = 0.005
 
-# 정상상태 펌프 속도 (수위 유지에 필요한 기본 펌프 속도)
+# Feed-forward steady-state pump speed that holds the setpoint.
 state_steady_speed = 10
 
 level_tolerance_cm = 0.05
 
-# 제어 주기 고정
+# Fixed control period in seconds.
 control_period_s = 3.0
 
-# 펌프 속도 범위
+# Pump speed limits.
 max_pump_speed = 20
 min_pump_speed = 0
 
+
+# Why some functions are not in class? I can certainly cleanup some codes like you asked.
+# But you may need to reorganize your codes and structure.  / sungwoo
 def clamp(value, lower, upper):
+    """Clamp ``value`` into the closed interval ``[lower, upper]``.
+
+    Args:
+        value: Input scalar to clamp.
+        lower: Lower bound (inclusive).
+        upper: Upper bound (inclusive).
+
+    Returns:
+        ``value`` bounded into ``[lower, upper]``.
+    """
     if value < lower:
         return lower
     elif value > upper:
@@ -42,35 +64,72 @@ def clamp(value, lower, upper):
     else:
         return value
 
-class sharedlevel:
+
+class SharedLevel:
+    """Thread-safe carrier for the most recent liquid-height reading.
+
+    Published by the sensing thread and consumed by the control thread.
+    Includes a validity flag and timestamp so the consumer can detect
+    stale data and fail safe.
+    """
+
     def __init__(self):
+        """Initialise empty state with the lock ready to use."""
         self.lock = threading.Lock()
         self.liquid_height_cm = None
         self.timestamp = 0.0
         self.valid = False
 
     def update(self, liquid_height_cm):
+        """Publish the latest measurement.
+
+        Args:
+            liquid_height_cm: Estimated height in cm, or ``None`` if the
+                detector could not produce a reading this frame.
+        """
         with self.lock:
             self.liquid_height_cm = liquid_height_cm
             self.timestamp = time.time()
             self.valid = liquid_height_cm is not None
 
     def get(self):
+        """Return the latest reading, its timestamp, and validity flag.
+
+        Returns:
+            Tuple ``(liquid_height_cm, timestamp, valid)``.
+        """
         with self.lock:
             return self.liquid_height_cm, self.timestamp, self.valid
 
 
-# log 저장용
-class sharedlog:
+class SharedLog:
+    """Thread-safe accumulator used for the post-run matplotlib plots.
+
+    Stores parallel arrays rather than a list of dicts so that matplotlib
+    can consume them directly with no further reshaping.
+    """
+
     def __init__(self):
+        """Initialise empty log buffers."""
         self.lock = threading.Lock()
         self.t = []
         self.level = []
         self.speed = []
         self.setpoint = []
-        self.error_i = []  # 적분 항 기록용
+        # Separate buffer for the integral term so we can sanity-check
+        # anti-windup behaviour after a run.
+        self.error_i = []
 
     def add(self, t, level, speed, setpoint, error_i=0.0):
+        """Append one sample to the log.
+
+        Args:
+            t: Absolute timestamp (seconds since epoch).
+            level: Measured liquid height in cm, or ``None``.
+            speed: Pump speed command issued this tick.
+            setpoint: Target level in cm.
+            error_i: PI integral term recorded at this tick.
+        """
         with self.lock:
             self.t.append(t)
             self.level.append(level)
@@ -79,24 +138,39 @@ class sharedlog:
             self.error_i.append(error_i)
 
     def snapshot(self):
-        with self.lock:
-            return (self.t[:], self.level[:], self.speed[:], self.setpoint[:], self.error_i[:])
+        """Return copies of the log buffers for plotting.
 
-# plot
-def plot_results(log: sharedlog):
+        Returns:
+            Tuple ``(t, level, speed, setpoint, error_i)``.
+        """
+        with self.lock:
+            return (
+                self.t[:],
+                self.level[:],
+                self.speed[:],
+                self.setpoint[:],
+                self.error_i[:],
+            )
+
+
+def plot_results(log: SharedLog):
+    """Show matplotlib plots for level, pump speed, and integral term.
+
+    Args:
+        log: Finalised log buffer from the control run.
+    """
     t, level, speed, sp, error_i = log.snapshot()
     if len(t) < 2:
-        print("plot할 데이터가 충분하지 않습니다.")
+        print("Not enough data to plot.")
         return
 
     t0 = t[0]
     t_rel = [x - t0 for x in t]
 
-    # None 값 제거 (수위 그래프용)
+    # Drop frames where sensing failed so the level line is contiguous.
     t_level = [tt for tt, lv in zip(t_rel, level) if lv is not None]
     level_valid = [lv for lv in level if lv is not None]
 
-    # (1) state 그래프: 수위 + setpoint
     plt.figure()
     plt.plot(t_level, level_valid, label="Liquid level (cm)")
     plt.axhline(setpoint_cm, linestyle="--", label="Setpoint (cm)")
@@ -106,7 +180,6 @@ def plot_results(log: sharedlog):
     plt.grid(True)
     plt.legend()
 
-    # (2) Input 그래프: Pump speed
     plt.figure()
     plt.plot(t_rel, speed, label="Pump speed (%)")
     plt.xlabel("Time (s)")
@@ -115,7 +188,6 @@ def plot_results(log: sharedlog):
     plt.grid(True)
     plt.legend()
 
-    # (3) 적분 항 그래프
     plt.figure()
     plt.plot(t_rel, error_i, label="Integral error")
     plt.xlabel("Time (s)")
@@ -127,89 +199,166 @@ def plot_results(log: sharedlog):
     plt.show()
 
 
-class PI_controller:
+class PIController:
+    """Discrete PI controller with feed-forward and clamping anti-windup.
+
+    The feed-forward term ``steady_state_speed`` approximates the pump
+    speed needed to hold the setpoint, letting the PI correction stay
+    small. Anti-windup uses back-calculation so the integral cannot
+    wind up while the output is saturated.
     """
-    PI 제어 + 정상상태
-    출력: state_steady_speed + Kp * error + Ki * integral_error
-    """
-    def __init__(self, kp, ki, steady_state_speed, max_speed, dt):
+
+    def __init__(
+        self,
+        kp,
+        ki,
+        steady_state_speed,
+        max_speed,
+        dt,
+    ):
+        """Store tuning parameters and reset the integral term.
+
+        Args:
+            kp: Proportional gain.
+            ki: Integral gain (per second).
+            steady_state_speed: Feed-forward pump speed for the setpoint.
+            max_speed: Upper saturation limit for the pump speed.
+            dt: Control period in seconds.
+        """
         self.kp = kp
         self.ki = ki
         self.steady_state_speed = steady_state_speed
         self.max_speed = max_speed
-        self.dt = dt  # 제어 주기
-        
-        # 적분 항 초기화
+        self.dt = dt
         self.integral_error = 0.0
-    
+
     def update(self, setpoint, measurement):
+        """Compute one pump speed command.
+
+        Applies a dead-band to suppress chatter near the setpoint and
+        adjusts the integral by back-calculation whenever the raw
+        command saturates.
+
+        Args:
+            setpoint: Desired liquid height in cm.
+            measurement: Current liquid height in cm.
+
+        Returns:
+            Tuple ``(speed, integral_error)`` where ``speed`` is an
+            integer pump command and ``integral_error`` is the updated
+            integral term.
+        """
         error = setpoint - measurement
-        
-        # Dead-band 적용
+
+        # Dead-band: treat tiny errors as zero to avoid pump chatter.
         if abs(error) < level_tolerance_cm:
             error = 0.0
-        
-        # 적분 항 업데이트
+
         self.integral_error += error * self.dt
-        
-        # PI 제어 + 정상상태 유량
-        speed_raw = self.steady_state_speed + self.kp * error + self.ki * self.integral_error
-        
-        # Anti-windup: Clamping 방식
+
+        speed_raw = (
+            self.steady_state_speed
+            + self.kp * error
+            + self.ki * self.integral_error
+        )
+
+        # Clamping anti-windup: bound the output, then back-calculate
+        # the integral so it reflects the actually-delivered command.
         speed = clamp(speed_raw, min_pump_speed, self.max_speed)
-        
-        # 출력이 포화되면 적분 항 조정 (back-calculation)
+
         if speed_raw != speed:
-            # 포화 발생 시 적분 항을 역계산하여 조정
-            self.integral_error = (speed - self.steady_state_speed - self.kp * error) / self.ki if self.ki != 0 else 0.0
-        
+            if self.ki != 0:
+                self.integral_error = (
+                    speed - self.steady_state_speed - self.kp * error
+                ) / self.ki
+            else:
+                self.integral_error = 0.0
+
         speed = int(speed)
-        
+
         return speed, self.integral_error
-    
+
     def reset(self):
-        """적분 항 리셋 (필요시 사용)"""
+        """Zero the integral term.
+
+        Intended for stale-data or startup fallbacks where the
+        accumulated error is no longer meaningful.
+        """
         self.integral_error = 0.0
 
 
-class pump_controller:
+class PumpController:
+    """Inlet pump plus inlet/outlet valve driver.
+
+    Opens both valves on construction so the rig is ready to flow, and
+    guarantees a stopped pump plus closed valves on shutdown.
     """
-    Inlet 펌프 제어 + 밸브 제어
-    """
-    def __init__(self, board_type="minima", inlet_valve_pin=7, outlet_valve_pin=5):
+
+    def __init__(
+        self,
+        board_type="minima",
+        inlet_valve_pin=7,
+        outlet_valve_pin=5,
+    ):
+        """Connect to the board and leave the rig in a ready state.
+
+        Args:
+            board_type: Arduino transport identifier for ``PyArduino``.
+            inlet_valve_pin: Digital pin driving the inlet solenoid.
+            outlet_valve_pin: Digital pin driving the outlet solenoid.
+        """
         self.pa = PyArduino(board_type)
         self.inlet_valve_pin = inlet_valve_pin
         self.outlet_valve_pin = outlet_valve_pin
-        
-        # 시작 시 모든 밸브 열기
+
         self.open_all_valves()
-        
-        # 펌프는 정지 상태로 시작
         self.set_pump_speed(0)
 
     def open_all_valves(self):
-        # 시작 시 모든 valve 열기
+        """Open both inlet and outlet valves and log the action."""
         self.pa.run_digital_write(self.inlet_valve_pin, True)
         self.pa.run_digital_write(self.outlet_valve_pin, True)
-        print("모든 밸브 열림 (Inlet: Pin 7, Outlet: Pin 5)")
+        print(
+            "All valves opened "
+            f"(inlet pin {self.inlet_valve_pin}, "
+            f"outlet pin {self.outlet_valve_pin})"
+        )
 
     def close_all_valves(self):
-        # 종료 시 모든 valve 닫기
+        """Close both inlet and outlet valves."""
         self.pa.run_digital_write(self.inlet_valve_pin, False)
         self.pa.run_digital_write(self.outlet_valve_pin, False)
-        print("\n모든 밸브 닫힘")
+        print("\nAll valves closed")
 
     def set_pump_speed(self, speed: int):
-        # 펌프 속도 설정 (0~20)
+        """Send a pump speed command via the MCP4728 DAC.
+
+        Args:
+            speed: Pump speed in the 0-20 range.
+        """
         self.pa.run_pump_speed(speed)
 
     def shutdown(self):
-        # 종료: 펌프 정지 & 밸브 닫기
+        """Stop the pump and close all valves on exit."""
         self.set_pump_speed(0)
         self.close_all_valves()
 
 
 def detect_tank_and_liquid(frame, model):
+    """Run YOLO on a frame and return the tank box and liquid line.
+
+    Keeps only the highest-confidence detection of each class so that
+    multiple spurious boxes do not destabilise the level estimate.
+
+    Args:
+        frame: BGR image from the camera.
+        model: Loaded ``ultralytics.YOLO`` model.
+
+    Returns:
+        Tuple ``(tank_box, liquid_line, inference_time_ms)`` where
+        ``tank_box`` is ``(x1, y1, x2, y2)`` or ``None``, and
+        ``liquid_line`` is the top Y of the liquid box or ``None``.
+    """
     inference_start_time = time.perf_counter()
     results = model(frame, conf=0.9, verbose=False)[0]
     inference_time_ms = (time.perf_counter() - inference_start_time) * 1000.0
@@ -229,7 +378,6 @@ def detect_tank_and_liquid(frame, model):
         if class_id == tank_class_id and conf > best_tank_confidence:
             best_tank_confidence = conf
             tank_box = (x1, y1, x2, y2)
-
         elif class_id == liquid_class_id and conf > best_liquid_confidence:
             best_liquid_confidence = conf
             liquid_line = y1
@@ -238,24 +386,53 @@ def detect_tank_and_liquid(frame, model):
 
 
 def calculate_liquidlevel_cm(liquid_line, tank_box):
+    """Convert detected pixel positions into a liquid height in cm.
+
+    Uses the detected tank bounding box as the per-frame pixel-to-cm
+    reference so changes in camera distance do not bias the estimate.
+
+    Args:
+        liquid_line: Top Y coordinate of the liquid bounding box.
+        tank_box: Tank bounding box as ``(x1, y1, x2, y2)``.
+
+    Returns:
+        Liquid height in cm, clamped into ``[0, tank_height_cm]``.
+        ``None`` if the tank box is degenerate.
+    """
     _, tank_top_y, _, tank_bottom_y = tank_box
-    
+
     if tank_bottom_y <= tank_top_y:
         return None
-    
-    liquid_height_cm = float(tank_bottom_y - liquid_line) / float(tank_bottom_y - tank_top_y) * tank_height_cm
-    liquid_height_cm = max(0.0, min(tank_height_cm, liquid_height_cm))
+
+    liquid_height_cm = (
+        float(tank_bottom_y - liquid_line)
+        / float(tank_bottom_y - tank_top_y)
+        * tank_height_cm
+    )
+    liquid_height_cm = max(
+        0.0,
+        min(tank_height_cm, liquid_height_cm),
+    )
     return liquid_height_cm
 
 
-def sensing_thread_fn(shared: sharedlevel, stop_event: threading.Event):
+def sensing_thread_fn(
+    shared: SharedLevel,
+    stop_event: threading.Event,
+):
+    """Capture frames and publish liquid-height estimates.
+
+    Args:
+        shared: Destination for the latest level reading.
+        stop_event: Event that signals the thread to exit. The thread
+            also sets this event on fatal errors so the control thread
+            can shut down safely.
+    """
     camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    # camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    # camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     model = YOLO(model_path)
 
     if not camera.isOpened():
-        print("카메라를 열 수 없습니다.")
+        print("Failed to open camera.")
         stop_event.set()
         return
 
@@ -266,50 +443,107 @@ def sensing_thread_fn(shared: sharedlevel, stop_event: threading.Event):
             inference_start_time = time.perf_counter()
 
             if not ret:
-                print("프레임을 읽을 수 없습니다.")
+                print("Failed to read frame.")
                 stop_event.set()
                 break
 
-            tank_box, liquid_line, inference_time_ms = detect_tank_and_liquid(frame, model)
+            tank_box, liquid_line, inference_time_ms = detect_tank_and_liquid(
+                frame, model
+            )
 
             liquid_height_cm = None
             if tank_box is not None:
                 x1, y1, x2, y2 = tank_box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 255, 0),
+                    2,
+                )
 
                 if liquid_line is not None:
-                    liquid_height_cm = calculate_liquidlevel_cm(liquid_line, tank_box)
-                    cv2.line(frame, (x1, liquid_line), (x2, liquid_line), (0, 255, 255), 2)
-                    cv2.putText(frame, f"Height: {liquid_height_cm:.2f}cm", (30, 40), cv2.FONT_ITALIC, 1, (0, 255, 255), 2)
+                    liquid_height_cm = calculate_liquidlevel_cm(
+                        liquid_line,
+                        tank_box,
+                    )
+                    cv2.line(
+                        frame,
+                        (x1, liquid_line),
+                        (x2, liquid_line),
+                        (0, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        frame,
+                        f"Height: {liquid_height_cm:.2f}cm",
+                        (30, 40),
+                        cv2.FONT_ITALIC,
+                        1,
+                        (0, 255, 255),
+                        2,
+                    )
                 else:
-                    cv2.putText(frame, "Liquidlevel is not detected.", (30, 40), cv2.FONT_ITALIC, 1, (0, 0, 255), 2)
+                    cv2.putText(
+                        frame,
+                        "Liquidlevel is not detected.",
+                        (30, 40),
+                        cv2.FONT_ITALIC,
+                        1,
+                        (0, 0, 255),
+                        2,
+                    )
             else:
-                cv2.putText(frame, "Tank is not detected.", (30, 40), cv2.FONT_ITALIC, 1, (0, 0, 255), 2)
+                cv2.putText(
+                    frame,
+                    "Tank is not detected.",
+                    (30, 40),
+                    cv2.FONT_ITALIC,
+                    1,
+                    (0, 0, 255),
+                    2,
+                )
 
             shared.update(liquid_height_cm)
 
             if show_display:
                 cv2.imshow(window_name, frame)
                 key = cv2.waitKey(10)
-                
-                # ESC 키를 누르면 종료
+
+                # ESC closes the window and stops the run.
                 if key & 0xFF == 27:
-                    print("\n프로그램 종료 중")
+                    print("\nShutting down")
                     stop_event.set()
                     break
-                
-                # 창을 닫으면 종료
-                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                    print("\n프로그램 종료 중")
+
+                # Manually closing the window also stops the run.
+                visible = cv2.getWindowProperty(
+                    window_name,
+                    cv2.WND_PROP_VISIBLE,
+                )
+                if visible < 1:
+                    print("\nShutting down")
                     stop_event.set()
                     break
 
             frame_display_done_time = time.perf_counter()
-            capture_to_display_ms = (frame_display_done_time - inference_start_time) * 1000
+            capture_to_display_ms = (
+                frame_display_done_time - inference_start_time
+            ) * 1000
             if liquid_height_cm is not None:
-                print(f"level:{liquid_height_cm:.2f}cm, inference:{inference_time_ms:.1f}ms, frame:{capture_to_display_ms:.1f}ms", end="\r")
+                print(
+                    f"level:{liquid_height_cm:.2f}cm, "
+                    f"inference:{inference_time_ms:.1f}ms, "
+                    f"frame:{capture_to_display_ms:.1f}ms",
+                    end="\r",
+                )
             else:
-                print(f"level:None, inference:{inference_time_ms:.1f}ms, frame:{capture_to_display_ms:.1f}ms", end="\r")
+                print(
+                    "level:None, "
+                    f"inference:{inference_time_ms:.1f}ms, "
+                    f"frame:{capture_to_display_ms:.1f}ms",
+                    end="\r",
+                )
 
     finally:
         camera.release()
@@ -317,12 +551,30 @@ def sensing_thread_fn(shared: sharedlevel, stop_event: threading.Event):
             cv2.destroyAllWindows()
 
 
-# log 인자 추가
-def control_thread_fn(shared: sharedlevel, pump: pump_controller, stop_event: threading.Event, log: sharedlog):
-    pi_controller = PI_controller(Kp, Ki, state_steady_speed, max_pump_speed, control_period_s)
+def control_thread_fn(
+    shared: SharedLevel,
+    pump: PumpController,
+    stop_event: threading.Event,
+    log: SharedLog,
+):
+    """Tick the PI controller and drive the pump until stopped.
 
-    # 센싱 데이터가 오래되면 안전 정지
-    STALE_SEC = 3.0
+    Args:
+        shared: Source of the latest liquid-height reading.
+        pump: Pump and valve driver.
+        stop_event: Event used to cooperatively stop the thread.
+        log: Destination for per-tick samples used in the final plot.
+    """
+    pi_controller = PIController(
+        kp,
+        ki,
+        state_steady_speed,
+        max_pump_speed,
+        control_period_s,
+    )
+
+    # Stop the pump if the last reading is older than this.
+    stale_sec = 3.0
 
     next_tick = time.time()
 
@@ -333,43 +585,66 @@ def control_thread_fn(shared: sharedlevel, pump: pump_controller, stop_event: th
                 time.sleep(min(0.05, next_tick - now))
                 continue
 
-            # 이번 tick 시작
             tick_start = time.time()
 
             liquid_height_cm, ts, valid = shared.get()
             age = time.time() - ts
 
-            if (not valid) or (liquid_height_cm is None) or (age > STALE_SEC):
+            if (not valid) or (liquid_height_cm is None) or (age > stale_sec):
                 pump.set_pump_speed(0)
-                pi_controller.reset()  # 적분 항 리셋
-                log.add(time.time(), liquid_height_cm, 0, setpoint_cm, 0.0)
+                pi_controller.reset()
+                log.add(
+                    time.time(),
+                    liquid_height_cm,
+                    0,
+                    setpoint_cm,
+                    0.0,
+                )
                 next_tick = tick_start + control_period_s
                 continue
 
-            # PI 제어 계산
-            speed, integral_error = pi_controller.update(setpoint_cm, liquid_height_cm)
+            speed, integral_error = pi_controller.update(
+                setpoint_cm,
+                liquid_height_cm,
+            )
 
-            # 펌프 제어
             pump.set_pump_speed(speed)
 
-            # 기록
-            log.add(time.time(), liquid_height_cm, speed, setpoint_cm, integral_error)
+            log.add(
+                time.time(),
+                liquid_height_cm,
+                speed,
+                setpoint_cm,
+                integral_error,
+            )
 
-            # 다음 tick 예약
             next_tick = tick_start + control_period_s
 
     finally:
-        pump.shutdown()  # 종료 시 펌프 정지 & 밸브 닫기
+        pump.shutdown()
 
 
 def main():
-    shared = sharedlevel()
-    log = sharedlog()
+    """Start the sensing and control threads and plot the final run."""
+    shared = SharedLevel()
+    log = SharedLog()
     stop_event = threading.Event()
-    pump = pump_controller(board_type="minima", inlet_valve_pin=7, outlet_valve_pin=5)
+    pump = PumpController(
+        board_type="minima",
+        inlet_valve_pin=7,
+        outlet_valve_pin=5,
+    )
 
-    t_sense = threading.Thread(target=sensing_thread_fn, args=(shared, stop_event), daemon=True)
-    t_ctrl = threading.Thread(target=control_thread_fn, args=(shared, pump, stop_event, log), daemon=True)
+    t_sense = threading.Thread(
+        target=sensing_thread_fn,
+        args=(shared, stop_event),
+        daemon=True,
+    )
+    t_ctrl = threading.Thread(
+        target=control_thread_fn,
+        args=(shared, pump, stop_event, log),
+        daemon=True,
+    )
 
     t_sense.start()
     t_ctrl.start()
@@ -378,15 +653,16 @@ def main():
         while not stop_event.is_set():
             time.sleep(0.1)
     except KeyboardInterrupt:
-        print("\n종료 신호 감지")
+        print("\nInterrupt received")
         stop_event.set()
 
     t_sense.join(timeout=1.0)
     t_ctrl.join(timeout=1.0)
-    
-    print("종료 완료")
+
+    print("Shutdown complete")
 
     plot_results(log)
+
 
 if __name__ == "__main__":
     main()

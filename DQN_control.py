@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-from PyArduino import PyArduino
+from py_arduino import PyArduino
 import matplotlib.pyplot as plt
 
 # 학습 때 사용한 DQN_training과 동일해야 함
