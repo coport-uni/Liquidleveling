@@ -27,7 +27,7 @@ setpoint_cm = 4.00
 
 show_display = True
 
-# PI gains (lower-case per CLAUDE.md Naming table).
+# PI gains
 kp = 4.0
 ki = 0.005
 
@@ -44,8 +44,6 @@ max_pump_speed = 20
 min_pump_speed = 0
 
 
-# Why some functions are not in class? I can certainly cleanup some codes like you asked.
-# But you may need to reorganize your codes and structure.  / sungwoo
 def clamp(value, lower, upper):
     """Clamp ``value`` into the closed interval ``[lower, upper]``.
 
@@ -344,76 +342,87 @@ class PumpController:
         self.close_all_valves()
 
 
-def detect_tank_and_liquid(frame, model):
-    """Run YOLO on a frame and return the tank box and liquid line.
+class LiquidLevelDetector:
+    """YOLO-based detector for tank and liquid level estimation.
 
-    Keeps only the highest-confidence detection of each class so that
-    multiple spurious boxes do not destabilise the level estimate.
-
-    Args:
-        frame: BGR image from the camera.
-        model: Loaded ``ultralytics.YOLO`` model.
-
-    Returns:
-        Tuple ``(tank_box, liquid_line, inference_time_ms)`` where
-        ``tank_box`` is ``(x1, y1, x2, y2)`` or ``None``, and
-        ``liquid_line`` is the top Y of the liquid box or ``None``.
+    Encapsulates the model loading, inference, and pixel-to-cm conversion
+    logic into a single cohesive unit.
     """
-    inference_start_time = time.perf_counter()
-    results = model(frame, conf=0.9, verbose=False)[0]
-    inference_time_ms = (time.perf_counter() - inference_start_time) * 1000.0
 
-    tank_box = None
-    best_tank_confidence = -1.0
+    def __init__(self, model_path, tank_height_cm, tank_class_id=1, liquid_class_id=0):
+        """Initialise the YOLO model and physical parameters.
 
-    liquid_line = None
-    best_liquid_confidence = -1.0
+        Args:
+            model_path: Path to the YOLO weights file.
+            tank_height_cm: Physical height of the tank in cm.
+            tank_class_id: Class index for the tank bounding box.
+            liquid_class_id: Class index for the liquid level line.
+        """
+        self.model = YOLO(model_path)
+        self.tank_height_cm = tank_height_cm
+        self.tank_class_id = tank_class_id
+        self.liquid_class_id = liquid_class_id
 
-    for box in results.boxes:
-        class_id = int(box.cls[0])
-        conf = float(box.conf[0])
+    def process_frame(self, frame):
+        """Run inference on a frame and calculate the liquid height.
 
-        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+        Args:
+            frame: BGR image from the camera.
 
-        if class_id == tank_class_id and conf > best_tank_confidence:
-            best_tank_confidence = conf
-            tank_box = (x1, y1, x2, y2)
-        elif class_id == liquid_class_id and conf > best_liquid_confidence:
-            best_liquid_confidence = conf
-            liquid_line = y1
+        Returns:
+            Tuple ``(tank_box, liquid_line, liquid_height_cm, inference_time_ms)``.
+            Values are ``None`` if detection fails.
+        """
+        tank_box, liquid_line, inference_time_ms = self.detect(frame)
 
-    return tank_box, liquid_line, inference_time_ms
+        liquid_height_cm = None
+        if tank_box is not None and liquid_line is not None:
+            liquid_height_cm = self.calculate_level(liquid_line, tank_box)
 
+        return tank_box, liquid_line, liquid_height_cm, inference_time_ms
 
-def calculate_liquidlevel_cm(liquid_line, tank_box):
-    """Convert detected pixel positions into a liquid height in cm.
+    def detect(self, frame):
+        """Find the highest-confidence tank and liquid detections."""
+        inference_start_time = time.perf_counter()
+        results = self.model(frame, conf=0.9, verbose=False)[0]
+        inference_time_ms = (time.perf_counter() - inference_start_time) * 1000.0
 
-    Uses the detected tank bounding box as the per-frame pixel-to-cm
-    reference so changes in camera distance do not bias the estimate.
+        tank_box = None
+        best_tank_confidence = -1.0
 
-    Args:
-        liquid_line: Top Y coordinate of the liquid bounding box.
-        tank_box: Tank bounding box as ``(x1, y1, x2, y2)``.
+        liquid_line = None
+        best_liquid_confidence = -1.0
 
-    Returns:
-        Liquid height in cm, clamped into ``[0, tank_height_cm]``.
-        ``None`` if the tank box is degenerate.
-    """
-    _, tank_top_y, _, tank_bottom_y = tank_box
+        for box in results.boxes:
+            class_id = int(box.cls[0])
+            conf = float(box.conf[0])
 
-    if tank_bottom_y <= tank_top_y:
-        return None
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
 
-    liquid_height_cm = (
-        float(tank_bottom_y - liquid_line)
-        / float(tank_bottom_y - tank_top_y)
-        * tank_height_cm
-    )
-    liquid_height_cm = max(
-        0.0,
-        min(tank_height_cm, liquid_height_cm),
-    )
-    return liquid_height_cm
+            if class_id == self.tank_class_id and conf > best_tank_confidence:
+                best_tank_confidence = conf
+                tank_box = (x1, y1, x2, y2)
+            elif class_id == self.liquid_class_id and conf > best_liquid_confidence:
+                best_liquid_confidence = conf
+                liquid_line = y1
+
+        return tank_box, liquid_line, inference_time_ms
+
+    def calculate_level(self, liquid_line, tank_box):
+        """Convert pixel coordinates to a physical height in cm.
+
+        Uses the detected tank bounding box as the per-frame pixel-to-cm
+        reference so changes in camera distance do not bias the estimate.
+        """
+        _, tank_top_y, _, tank_bottom_y = tank_box
+
+        if tank_bottom_y <= tank_top_y:
+            return None
+
+        ratio = float(tank_bottom_y - liquid_line) / float(tank_bottom_y - tank_top_y)
+        liquid_height_cm = ratio * self.tank_height_cm
+
+        return clamp(liquid_height_cm, 0.0, self.tank_height_cm)
 
 
 def sensing_thread_fn(
@@ -429,7 +438,13 @@ def sensing_thread_fn(
             can shut down safely.
     """
     camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    model = YOLO(model_path)
+    
+    detector = LiquidLevelDetector(
+        model_path=model_path,
+        tank_height_cm=tank_height_cm,
+        tank_class_id=tank_class_id,
+        liquid_class_id=liquid_class_id,
+    )
 
     if not camera.isOpened():
         print("Failed to open camera.")
@@ -440,18 +455,15 @@ def sensing_thread_fn(
     try:
         while not stop_event.is_set():
             ret, frame = camera.read()
-            inference_start_time = time.perf_counter()
+            loop_start_time = time.perf_counter()
 
             if not ret:
                 print("Failed to read frame.")
                 stop_event.set()
                 break
 
-            tank_box, liquid_line, inference_time_ms = detect_tank_and_liquid(
-                frame, model
-            )
+            tank_box, liquid_line, liquid_height_cm, inference_time_ms = detector.process_frame(frame)
 
-            liquid_height_cm = None
             if tank_box is not None:
                 x1, y1, x2, y2 = tank_box
                 cv2.rectangle(
@@ -462,11 +474,7 @@ def sensing_thread_fn(
                     2,
                 )
 
-                if liquid_line is not None:
-                    liquid_height_cm = calculate_liquidlevel_cm(
-                        liquid_line,
-                        tank_box,
-                    )
+                if liquid_line is not None and liquid_height_cm is not None:
                     cv2.line(
                         frame,
                         (x1, liquid_line),
@@ -528,8 +536,9 @@ def sensing_thread_fn(
 
             frame_display_done_time = time.perf_counter()
             capture_to_display_ms = (
-                frame_display_done_time - inference_start_time
+                frame_display_done_time - loop_start_time
             ) * 1000
+            
             if liquid_height_cm is not None:
                 print(
                     f"level:{liquid_height_cm:.2f}cm, "
