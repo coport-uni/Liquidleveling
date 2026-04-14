@@ -50,14 +50,25 @@ num_episodes = 1000
 
 
 # 2. Replay Buffer
-Transition = collections.namedtuple("Transition", ("state", "action", "reward", "next_state"))
+Transition = collections.namedtuple(
+    "Transition",
+    ("state", "action", "reward", "next_state"),
+)
+
 
 class ReplayBuffer:
-    """Experience Replay Buffer to store and sample transitions."""
+    """Experience replay buffer to store and sample transitions."""
+
     def __init__(self, max_length: int):
         self.buffer = collections.deque(maxlen=max_length)
 
-    def put_data(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray) -> None:
+    def put_data(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+    ) -> None:
         """Store a new transition in the buffer."""
         self.buffer.append(Transition(state, action, reward, next_state))
 
@@ -71,10 +82,11 @@ class ReplayBuffer:
 
 # 3. Q-Network (MLP)
 class QNetwork(nn.Module):
-    """Multilayer Perceptron for approximating Q-values."""
+    """Multilayer perceptron for approximating Q-values."""
+
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
-        
+
         hidden_layer1 = 128
         hidden_layer2 = 128
 
@@ -83,7 +95,7 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_layer1, hidden_layer2),
             nn.ReLU(),
-            nn.Linear(hidden_layer2, output_dim)
+            nn.Linear(hidden_layer2, output_dim),
         )
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
@@ -93,28 +105,30 @@ class QNetwork(nn.Module):
 
 # 4. Agent
 class DQNAgent:
-    """Deep Q-Network Agent for pump speed control."""
+    """Deep Q-Network agent for pump speed control."""
+
     def __init__(self, state_dims: int, action_dims: int):
         self.state_dims = state_dims
         self.action_dims = action_dims
 
-        # Networks
-        self.qNet = QNetwork(state_dims, action_dims)
+        self.q_net = QNetwork(state_dims, action_dims)
         self.target_net = QNetwork(state_dims, action_dims)
-        self.target_net.load_state_dict(self.qNet.state_dict())
-        self.optimizer = optim.AdamW(self.qNet.parameters(), lr=learning_rate)
-        
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.optimizer = optim.AdamW(
+            self.q_net.parameters(), lr=learning_rate
+        )
+
         self.buffer = ReplayBuffer(buffer_size)
 
-        # Exploration parameters
         self.epsilon = epsilon_start
         self.steps_done = 0
         self.episodes_done = 0
 
-        # Internal state tracking (Not directly in observation, used for control logic)
+        # These track control history across steps and feed the reward
+        # signal; they are not part of the observation vector.
         self.u_prev = float((min_pump_speed + max_pump_speed) // 2)
         self.error_int = 0.0
-        
+
         self.training_losses: List[float] = []
 
     def action_to_u(self, action: int) -> int:
@@ -131,37 +145,44 @@ class DQNAgent:
         self.error_int = 0.0
 
     def build_state(self, h: float) -> np.ndarray:
-        """Normalize and construct the state vector from the current liquid height."""
+        """Construct the normalised observation vector.
+
+        Each component is scaled so that the network sees inputs in
+        roughly [-1, 1], which keeps gradients well-conditioned.
+        """
         error = setpoint_cm - h
-        
+
         state = np.array([
-            h / tank_height_cm,                          # [0, 1]
-            error / tank_height_cm,                      # [-1, 1]
-            np.clip(self.error_int, -10.0, 10.0) / 10.0, # [-1, 1]
+            h / tank_height_cm,
+            error / tank_height_cm,
+            np.clip(self.error_int, -10.0, 10.0) / 10.0,
         ], dtype=np.float32)
-        
+
         return state
 
-    def select_action(self, state: np.ndarray, training: bool = True) -> int:
+    def select_action(
+        self, state: np.ndarray, training: bool = True
+    ) -> int:
         """Epsilon-greedy action selection."""
         if training and random.random() < self.epsilon:
             return random.randint(0, self.action_dims - 1)
 
         with torch.no_grad():
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-            q_values = self.qNet(state_tensor)
+            state_tensor = torch.tensor(
+                state, dtype=torch.float32
+            ).unsqueeze(0)
+            q_values = self.q_net(state_tensor)
             return int(q_values.argmax(dim=1).item())
 
     def compute_reward(self, h: float, u: float) -> float:
-        """Calculate the reward based on tracking error and control smoothness.
-        
-        Simplified Reward: R = -|error| - (lambda * |delta_u|)
+        """Return reward R = -|error| - 0.05 * |delta_u|.
+
+        The smoothness term is essential to suppress pump chattering;
+        without it the policy oscillates between adjacent speeds.
         """
-        # 1. Tracking Penalty: Penalize absolute distance from setpoint.
         error = abs(h - setpoint_cm)
         tracking_penalty = -error
-        
-        # 2. Smoothness Penalty: Penalize abrupt changes to prevent chattering.
+
         delta_u = abs(u - self.u_prev)
         smoothness_penalty = -0.05 * delta_u
 
@@ -174,46 +195,66 @@ class DQNAgent:
 
         minibatch = self.buffer.sample_minibatch()
 
-        # Convert to tensors
-        state_batch = torch.tensor(np.array([t.state for t in minibatch]), dtype=torch.float32)
-        action_batch = torch.tensor([t.action for t in minibatch], dtype=torch.int64)
-        reward_batch = torch.tensor([t.reward for t in minibatch], dtype=torch.float32)
-        next_state_batch = torch.tensor(np.array([t.next_state for t in minibatch]), dtype=torch.float32)
-        
-        # Current Q-values: Q(s, a)
-        q_values = self.qNet(state_batch).gather(1, action_batch.unsqueeze(1)).squeeze(1)
+        state_batch = torch.tensor(
+            np.array([t.state for t in minibatch]),
+            dtype=torch.float32,
+        )
+        action_batch = torch.tensor(
+            [t.action for t in minibatch], dtype=torch.int64
+        )
+        reward_batch = torch.tensor(
+            [t.reward for t in minibatch], dtype=torch.float32
+        )
+        next_state_batch = torch.tensor(
+            np.array([t.next_state for t in minibatch]),
+            dtype=torch.float32,
+        )
 
-        # Target Q-values: r + gamma * max_a' Q_target(s', a')
+        q_values = (
+            self.q_net(state_batch)
+            .gather(1, action_batch.unsqueeze(1))
+            .squeeze(1)
+        )
+
         with torch.no_grad():
             next_q_values = self.target_net(next_state_batch).max(1)[0]
             targets = reward_batch + gamma * next_q_values
 
         loss = F.smooth_l1_loss(q_values, targets)
 
-        # Optimization
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.qNet.parameters(), 1.0) # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 1.0)
         self.optimizer.step()
 
         loss_value = float(loss.item())
         self.training_losses.append(loss_value)
-        
+
         return loss_value
 
     def update_target(self) -> None:
-        """Soft update of the target network parameters."""
-        for target_param, policy_param in zip(self.target_net.parameters(), self.qNet.parameters()):
-            target_param.data.copy_(tau * policy_param.data + (1.0 - tau) * target_param.data)
+        """Soft-update the target network toward the policy network."""
+        pairs = zip(
+            self.target_net.parameters(), self.q_net.parameters()
+        )
+        for target_param, policy_param in pairs:
+            target_param.data.copy_(
+                tau * policy_param.data
+                + (1.0 - tau) * target_param.data
+            )
 
     def decay_epsilon(self) -> None:
-        """Decay the exploration rate."""
+        """Decay the exploration rate toward its floor."""
         self.epsilon = max(epsilon_end, self.epsilon * epsilon_decay)
 
     def save(self, path: str) -> None:
-        """Save the model checkpoint."""
+        """Save the model checkpoint.
+
+        The policy-network state dict is stored under the legacy key
+        "qNet" so existing ``.pth`` files remain loadable.
+        """
         torch.save({
-            "qNet": self.qNet.state_dict(),
+            "qNet": self.q_net.state_dict(),
             "target_net": self.target_net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "epsilon": self.epsilon,
@@ -224,33 +265,38 @@ class DQNAgent:
         print(f"Model successfully saved to {path}")
 
     def load(self, path: str) -> None:
-        """Load the model checkpoint."""
-        checkpoint = torch.load(path, map_location='cpu')
-        
-        self.qNet.load_state_dict(checkpoint["qNet"])
+        """Load a previously saved model checkpoint."""
+        checkpoint = torch.load(path, map_location="cpu")
+
+        self.q_net.load_state_dict(checkpoint["qNet"])
         self.target_net.load_state_dict(checkpoint["target_net"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
-        
+
         self.epsilon = float(checkpoint["epsilon"])
         self.episodes_done = int(checkpoint.get("episodes_done", 0))
         self.steps_done = int(checkpoint.get("steps_done", 0))
-        
+
         if "training_losses" in checkpoint:
             self.training_losses = checkpoint["training_losses"]
-            
-        print(f"Model loaded from {path} | Episodes: {self.episodes_done} | Epsilon: {self.epsilon:.4f}")
+
+        print(
+            f"Model loaded from {path} | "
+            f"Episodes: {self.episodes_done} | "
+            f"Epsilon: {self.epsilon:.4f}"
+        )
 
 
 # 5. Environment Simulator
 class WaterTankSimulator:
-    """A linear difference equation simulator representing the water tank dynamics."""
+    """First-order difference-equation model of the water tank."""
+
     def __init__(self):
-        # Difference equation coefficients: h(k+1) = a*h(k) + b*u(k) + c
+        # h(k+1) = a*h(k) + b*u(k) + c
         self.a = 0.95
         self.b = 0.05
         self.c = -0.3
         self.h = setpoint_cm
-        
+
         self.process_noise_std = 0.05
         self.measure_noise_std = 0.02
 
@@ -260,33 +306,45 @@ class WaterTankSimulator:
         return self.h
 
     def step_env(self, u: int) -> float:
-        """Apply pump speed and return the newly measured liquid level."""
+        """Apply pump speed and return the newly measured level."""
         u = int(np.clip(u, min_pump_speed, max_pump_speed))
 
-        # True state update with process noise
-        self.h = (self.a * self.h) + (self.b * u) + self.c + float(np.random.normal(0, self.process_noise_std))
+        process_noise = float(
+            np.random.normal(0, self.process_noise_std)
+        )
+        self.h = (
+            self.a * self.h + self.b * u + self.c + process_noise
+        )
         self.h = float(np.clip(self.h, 0.0, tank_height_cm))
 
-        # Measurement with sensor noise
-        h_measured = self.h + float(np.random.normal(0, self.measure_noise_std))
+        measure_noise = float(
+            np.random.normal(0, self.measure_noise_std)
+        )
+        h_measured = self.h + measure_noise
         return float(np.clip(h_measured, 0.0, tank_height_cm))
 
 
 # 6. Training Routine
-def plot_training_results(rewards: List[float], losses: List[float]) -> None:
-    """Plot the learning curves (Reward and Loss)."""
+def plot_training_results(
+    rewards: List[float], losses: List[float]
+) -> None:
+    """Plot the reward and loss learning curves."""
     plt.figure(figsize=(12, 4))
-    plt.suptitle("DQN Water Tank Training Results", fontsize=14, fontweight="bold")
+    plt.suptitle(
+        "DQN Water Tank Training Results",
+        fontsize=14,
+        fontweight="bold",
+    )
 
     plt.subplot(1, 2, 1)
-    plt.plot(rewards, alpha=0.7, color='green')
+    plt.plot(rewards, alpha=0.7, color="green")
     plt.title("Episode Cumulative Reward")
     plt.xlabel("Episode")
     plt.ylabel("Reward")
     plt.grid(True, alpha=0.3)
 
     plt.subplot(1, 2, 2)
-    plt.plot(losses, alpha=0.7, color='red')
+    plt.plot(losses, alpha=0.7, color="red")
     plt.title("Average Training Loss")
     plt.xlabel("Episode")
     plt.ylabel("Loss")
@@ -297,10 +355,17 @@ def plot_training_results(rewards: List[float], losses: List[float]) -> None:
 
 
 def train() -> None:
+    """Run the full training loop and save the resulting model."""
     print("=== Starting DQN Training ===")
-    print(f"State dimensions: {state_dims} [h_norm, error_norm, error_int_norm]")
-    print(f"Action dimensions: {action_dims} (speeds {min_pump_speed}~{max_pump_speed})")
-    
+    print(
+        f"State dimensions: {state_dims} "
+        f"[h_norm, error_norm, error_int_norm]"
+    )
+    print(
+        f"Action dimensions: {action_dims} "
+        f"(speeds {min_pump_speed}~{max_pump_speed})"
+    )
+
     agent = DQNAgent(state_dims, action_dims)
     env = WaterTankSimulator()
 
@@ -322,20 +387,19 @@ def train() -> None:
 
             h_next = env.step_env(u)
 
-            # Calculate Reward
             reward = agent.compute_reward(h_next, u)
 
-            # Update Internal Tracking State
             agent.u_prev = float(u)
             agent.error_int = float(np.clip(
-                agent.error_int + (setpoint_cm - h_next) * control_period_s,
-                -10.0, 10.0
+                agent.error_int
+                + (setpoint_cm - h_next) * control_period_s,
+                -10.0,
+                10.0,
             ))
 
             next_state = agent.build_state(h_next)
             agent.buffer.put_data(state, action, reward, next_state)
 
-            # Train Network
             loss = agent.train_step()
             if loss is not None:
                 ep_losses.append(loss)
@@ -364,6 +428,7 @@ def train() -> None:
     print("=== Training Completed ===")
     agent.save("dqn_liquid_level_model.pth")
     plot_training_results(episode_rewards, losses)
+
 
 if __name__ == "__main__":
     train()
